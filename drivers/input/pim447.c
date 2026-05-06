@@ -27,6 +27,8 @@
  * via the Zephyr input subsystem. ZMK picks these up through zmk,input-listener.
  */
 
+#define DT_DRV_COMPAT pimoroni_pim447
+
 #include <zephyr/device.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/input/input.h>

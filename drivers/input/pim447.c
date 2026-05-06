@@ -148,10 +148,10 @@ static void pim447_poll_handler(struct k_work *work)
     /* Report movement if non-zero */
     if (dx != 0 || dy != 0) {
         if (dx != 0) {
-            input_report_rel(dev, INPUT_REL_X, dx, dy == 0, NULL);
+            input_report_rel(dev, INPUT_REL_X, dx, dy == 0);
         }
         if (dy != 0) {
-            input_report_rel(dev, INPUT_REL_Y, dy, true, NULL);
+            input_report_rel(dev, INPUT_REL_Y, dy, true);
         }
         LOG_DBG("dx=%d dy=%d", dx, dy);
     }
@@ -159,7 +159,7 @@ static void pim447_poll_handler(struct k_work *work)
     /* Report button state changes */
     bool btn_pressed = (motion.sw & PIM447_MSK_SWITCH_STATE) != 0;
     if (btn_pressed != data->prev_btn_state) {
-        input_report_key(dev, INPUT_BTN_0, btn_pressed ? 1 : 0, true, NULL);
+        input_report_key(dev, INPUT_BTN_0, btn_pressed ? 1 : 0, true);
         data->prev_btn_state = btn_pressed;
         LOG_DBG("btn=%d", btn_pressed);
     }

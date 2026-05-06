@@ -1,0 +1,20 @@
+menuconfig PIM447
+	bool "Pimoroni PIM447 Trackball Breakout driver"
+	default y
+	depends on I2C && DT_HAS_PIMORONI_PIM447_ENABLED
+	select INPUT
+	help
+	  Enable driver for the Pimoroni PIM447 I2C trackball breakout.
+	  Reports X/Y relative movement and button click as Zephyr input events.
+	  Also provides RGBW LED control via I2C registers.
+
+if PIM447
+
+config PIM447_LOG_LEVEL
+	int "Log level for PIM447 driver"
+	default 0
+	range 0 4
+	help
+	  0 = OFF, 1 = ERR, 2 = WRN, 3 = INF, 4 = DBG
+
+endif # PIM447

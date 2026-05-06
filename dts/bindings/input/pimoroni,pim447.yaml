@@ -1,0 +1,31 @@
+description: |
+  Pimoroni PIM447 Trackball Breakout - I2C RGBW-illuminated clickable trackball.
+  Uses an onboard Nuvoton MCU to read 4 Hall-effect sensors and a dome switch,
+  and exposes movement deltas (left/right/up/down), click state, and RGBW LED
+  control over I2C.
+
+  Default I2C address is 0x0A (0x0B if address trace is cut).
+
+compatible: "pimoroni,pim447"
+
+include: [i2c-device.yaml]
+
+properties:
+  poll-interval-ms:
+    type: int
+    default: 15
+    description: |
+      Polling interval in milliseconds. Lower values give smoother tracking
+      but increase power consumption. 15ms (~67Hz) is a good balance.
+
+  swap-xy:
+    type: boolean
+    description: Swap X and Y axes.
+
+  invert-x:
+    type: boolean
+    description: Invert the X axis.
+
+  invert-y:
+    type: boolean
+    description: Invert the Y axis.

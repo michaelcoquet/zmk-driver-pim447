@@ -1,0 +1,6 @@
+name: pim447
+build:
+  cmake: drivers/input
+  kconfig: drivers/input/Kconfig
+  settings:
+    dts_root: .

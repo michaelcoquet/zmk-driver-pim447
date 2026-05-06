@@ -3,7 +3,7 @@ config PIM447
 	default y
 	depends on DT_HAS_PIMORONI_PIM447_ENABLED
 	depends on I2C
-	select INPUT
+	depends on INPUT
 	help
 	  Enable driver for the Pimoroni PIM447 I2C trackball breakout.
 	  Reports X/Y relative movement and button click as Zephyr input events.

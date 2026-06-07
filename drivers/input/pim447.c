@@ -4,46 +4,31 @@
  *
  * Zephyr input driver for the Pimoroni PIM447 Trackball Breakout.
  *
- * The PIM447 has an onboard Nuvoton MCU that reads 4 Hall-effect sensors
- * and a dome switch, then exposes the data over I2C at address 0x0A:
+ * MOVEMENT MODEL
+ * --------------
+ * The PIM447 is a low-resolution sensor. A vigorous swipe generates only
+ * 5-10 counts. To make the trackball useful on large displays, we need
+ * aggressive top-end scaling without losing precision for slow movements.
  *
- *   Register  Description
- *   --------  -----------
- *   0x00      LED Red   (0-255, write)
- *   0x01      LED Green (0-255, write)
- *   0x02      LED Blue  (0-255, write)
- *   0x03      LED White (0-255, write)
- *   0x04      Left movement delta (read, clears on read)
- *   0x05      Right movement delta (read, clears on read)
- *   0x06      Up movement delta (read, clears on read)
- *   0x07      Down movement delta (read, clears on read)
- *   0x08      Switch state (bit 7 = pressed, bits 0-6 unused; clears on read)
+ * The driver computes acceleration based on the COMBINED magnitude of dx
+ * and dy (not per-axis) so that diagonal movements receive the same boost
+ * as straight ones. The same scale factor is applied to both axes
+ * proportionally - so a 45-degree swipe accelerates as much as a pure
+ * horizontal swipe of the same speed.
  *
- * Reading 5 bytes starting from register 0x04 returns [left, right, up, down, switch]
- * atomically in a single I2C transaction.
+ * Formula (integer math):
+ *   mag        = approx sqrt(dx^2 + dy^2)
+ *   over       = max(0, mag - accel-divisor)
+ *   scale_num  = base-scale + over^accel-exponent  (clamped)
+ *   dx_out     = dx * scale_num / 16
+ *   dy_out     = dy * scale_num / 16
  *
- * This driver polls at a configurable interval, computes net X/Y deltas,
- * optionally applies a configurable acceleration curve, and reports the
- * resulting movement as INPUT_REL_X / INPUT_REL_Y / INPUT_BTN_0 events
- * via the Zephyr input subsystem. ZMK picks these up through zmk,input-listener.
+ * base-scale is in 1/16ths (i.e. base-scale=16 = 1.0x linear).
  *
- * Acceleration model (per-axis, integer math):
- *
- *   if |delta| <= accel-threshold:
- *       output = delta
- *   else:
- *       over    = |delta| - accel-threshold
- *       output  = delta * (ACCEL_BASE + over * accel-factor) / ACCEL_BASE
- *
- * With ACCEL_BASE = 16, the formula gives 1:1 below the threshold and
- * progressively boosts faster movements. With accel-factor = 4 and
- * accel-threshold = 1:
- *
- *   delta    1  2  3   4   5   6   7   8
- *   output   1  2  4   7  10  13  16  22
- *
- * Larger accel-factor values give more aggressive acceleration. Set
- * accel-factor = 0 to disable acceleration (pure linear).
+ * Reasonable starting values for a 1080p display:
+ *   base-scale = 32       (2.0x linear baseline)
+ *   accel-divisor = 2     (start accelerating after 2 counts)
+ *   accel-exponent = 2    (quadratic)
  */
 
 #define DT_DRV_COMPAT pimoroni_pim447
@@ -57,7 +42,6 @@
 
 LOG_MODULE_REGISTER(pim447, CONFIG_PIM447_LOG_LEVEL);
 
-/* PIM447 I2C register addresses */
 #define PIM447_REG_LED_RED   0x00
 #define PIM447_REG_LED_GRN   0x01
 #define PIM447_REG_LED_BLU   0x02
@@ -70,12 +54,9 @@ LOG_MODULE_REGISTER(pim447, CONFIG_PIM447_LOG_LEVEL);
 
 #define PIM447_MSK_SWITCH_STATE 0x80
 
-/* Acceleration fixed-point base. Acceleration curve formula uses this as
- * the denominator. Higher values give finer control granularity in the
- * accel-factor devicetree property. */
-#define ACCEL_BASE 16
+/* Caps the maximum scale factor to prevent overflow on huge deltas. */
+#define ACCEL_SCALE_MAX 16384
 
-/* Packed movement + switch data (5 bytes from reg 0x04) */
 struct pim447_motion_data {
     uint8_t left;
     uint8_t right;
@@ -90,8 +71,9 @@ struct pim447_config {
     bool swap_xy;
     bool invert_x;
     bool invert_y;
-    uint16_t accel_factor;
-    uint16_t accel_threshold;
+    uint16_t base_scale;
+    uint16_t accel_divisor;
+    uint8_t  accel_exponent;
 };
 
 struct pim447_data {
@@ -101,40 +83,73 @@ struct pim447_data {
 };
 
 /**
- * Apply per-axis acceleration curve. Returns input unchanged when
- * acceleration is disabled (accel_factor == 0) or when |delta| is at or
- * below the threshold.
+ * Integer approximation of sqrt(x^2 + y^2) using alpha-max-plus-beta-min
+ * (alpha=15/16, beta=15/32). Accurate to ~3.5%, plenty for cursor accel.
  */
-static int16_t apply_acceleration(int16_t delta, const struct pim447_config *cfg)
+static inline uint32_t approx_magnitude(int32_t x, int32_t y)
 {
-    if (delta == 0 || cfg->accel_factor == 0) {
-        return delta;
-    }
-
-    int32_t abs_d = (delta < 0) ? -(int32_t)delta : (int32_t)delta;
-    if (abs_d <= (int32_t)cfg->accel_threshold) {
-        return delta;
-    }
-
-    int32_t over = abs_d - (int32_t)cfg->accel_threshold;
-    int32_t scaled = ((int32_t)delta * (ACCEL_BASE + over * (int32_t)cfg->accel_factor))
-                     / ACCEL_BASE;
-
-    /* Clamp to int16_t range */
-    if (scaled > INT16_MAX) {
-        scaled = INT16_MAX;
-    } else if (scaled < INT16_MIN) {
-        scaled = INT16_MIN;
-    }
-
-    return (int16_t)scaled;
+    uint32_t ax = (x < 0) ? -x : x;
+    uint32_t ay = (y < 0) ? -y : y;
+    uint32_t max_v = (ax > ay) ? ax : ay;
+    uint32_t min_v = (ax > ay) ? ay : ax;
+    return ((max_v * 15) >> 4) + ((min_v * 15) >> 5);
 }
 
 /**
- * Read motion and switch data from the PIM447 in a single atomic
- * 5-byte burst read starting at register 0x04. The PIM447's internal
- * counters all clear on read, so reading them together guarantees the
- * four directional values were sampled at the same instant.
+ * Integer power with overflow clamp.
+ */
+static inline uint32_t int_pow_clamped(uint32_t base, uint8_t exp)
+{
+    if (base == 0) {
+        return (exp == 0) ? 1 : 0;
+    }
+    uint32_t result = 1;
+    for (uint8_t i = 0; i < exp; i++) {
+        if (result > ACCEL_SCALE_MAX) {
+            return ACCEL_SCALE_MAX;
+        }
+        result *= base;
+    }
+    return (result > ACCEL_SCALE_MAX) ? ACCEL_SCALE_MAX : result;
+}
+
+/**
+ * Magnitude-based acceleration. The same scale factor is applied to both
+ * axes so diagonal swipes get the same boost as straight ones.
+ */
+static void apply_acceleration(int16_t dx, int16_t dy,
+                               const struct pim447_config *cfg,
+                               int16_t *dx_out, int16_t *dy_out)
+{
+    if (dx == 0 && dy == 0) {
+        *dx_out = 0;
+        *dy_out = 0;
+        return;
+    }
+
+    uint32_t scale_num;
+    if (cfg->accel_exponent == 0 || cfg->accel_divisor == 0) {
+        scale_num = cfg->base_scale;
+    } else {
+        uint32_t mag = approx_magnitude(dx, dy);
+        uint32_t over = (mag > cfg->accel_divisor)
+                        ? (mag - cfg->accel_divisor) : 0;
+        scale_num = cfg->base_scale + int_pow_clamped(over, cfg->accel_exponent);
+        if (scale_num > ACCEL_SCALE_MAX) {
+            scale_num = ACCEL_SCALE_MAX;
+        }
+    }
+
+    /* base unit is 16, so divide by 16 after multiplying */
+    int32_t sx = ((int32_t)dx * (int32_t)scale_num) / 16;
+    int32_t sy = ((int32_t)dy * (int32_t)scale_num) / 16;
+
+    *dx_out = (int16_t)CLAMP(sx, INT16_MIN, INT16_MAX);
+    *dy_out = (int16_t)CLAMP(sy, INT16_MIN, INT16_MAX);
+}
+
+/**
+ * Atomic 5-byte burst read of registers 0x04-0x08.
  */
 static int pim447_read_motion(const struct device *dev, struct pim447_motion_data *motion)
 {
@@ -158,10 +173,6 @@ static int pim447_read_motion(const struct device *dev, struct pim447_motion_dat
     return 0;
 }
 
-/**
- * Set the RGBW LED color.
- * Writes 4 bytes to registers 0x00-0x03.
- */
 int pim447_set_led(const struct device *dev, uint8_t r, uint8_t g, uint8_t b, uint8_t w)
 {
     const struct pim447_config *cfg = dev->config;
@@ -170,11 +181,6 @@ int pim447_set_led(const struct device *dev, uint8_t r, uint8_t g, uint8_t b, ui
     return i2c_write_dt(&cfg->i2c, buf, sizeof(buf));
 }
 
-/**
- * Periodic poll work handler.
- * Reads motion data, computes net deltas, applies acceleration,
- * and reports input events.
- */
 static void pim447_poll_handler(struct k_work *work)
 {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
@@ -189,15 +195,12 @@ static void pim447_poll_handler(struct k_work *work)
         goto reschedule;
     }
 
-    /* Compute signed deltas from the unsigned left/right/up/down counters */
-    int16_t dx = (int16_t)motion.right - (int16_t)motion.left;
-    int16_t dy = (int16_t)motion.down  - (int16_t)motion.up;
+    int16_t dx_raw = (int16_t)motion.right - (int16_t)motion.left;
+    int16_t dy_raw = (int16_t)motion.down  - (int16_t)motion.up;
 
-    /* Apply per-axis acceleration curve */
-    dx = apply_acceleration(dx, cfg);
-    dy = apply_acceleration(dy, cfg);
+    int16_t dx, dy;
+    apply_acceleration(dx_raw, dy_raw, cfg, &dx, &dy);
 
-    /* Apply axis transformations */
     if (cfg->swap_xy) {
         int16_t tmp = dx;
         dx = dy;
@@ -210,7 +213,6 @@ static void pim447_poll_handler(struct k_work *work)
         dy = -dy;
     }
 
-    /* Report movement if non-zero */
     if (dx != 0 || dy != 0) {
         if (dx != 0) {
             input_report_rel(dev, INPUT_REL_X, dx, dy == 0, K_FOREVER);
@@ -218,10 +220,9 @@ static void pim447_poll_handler(struct k_work *work)
         if (dy != 0) {
             input_report_rel(dev, INPUT_REL_Y, dy, true, K_FOREVER);
         }
-        LOG_DBG("dx=%d dy=%d", dx, dy);
+        LOG_DBG("raw=(%d,%d) accel=(%d,%d)", dx_raw, dy_raw, dx, dy);
     }
 
-    /* Report button state changes */
     bool btn_pressed = (motion.sw & PIM447_MSK_SWITCH_STATE) != 0;
     if (btn_pressed != data->prev_btn_state) {
         input_report_key(dev, INPUT_BTN_0, btn_pressed ? 1 : 0, true, K_FOREVER);
@@ -233,9 +234,6 @@ reschedule:
     k_work_reschedule(dwork, K_MSEC(cfg->poll_interval_ms));
 }
 
-/**
- * Device initialization.
- */
 static int pim447_init(const struct device *dev)
 {
     const struct pim447_config *cfg = dev->config;
@@ -250,29 +248,25 @@ static int pim447_init(const struct device *dev)
     data->dev = dev;
     data->prev_btn_state = false;
 
-    /* Set a dim white LED to indicate the trackball is active */
     ret = pim447_set_led(dev, 0, 0, 0, 30);
     if (ret < 0) {
         LOG_WRN("Failed to set initial LED: %d (continuing anyway)", ret);
     }
 
-    /* Flush any stale motion data */
     struct pim447_motion_data dummy;
     pim447_read_motion(dev, &dummy);
 
-    /* Start polling */
     k_work_init_delayable(&data->poll_work, pim447_poll_handler);
     k_work_reschedule(&data->poll_work, K_MSEC(cfg->poll_interval_ms));
 
     LOG_INF("PIM447 trackball initialized (poll=%dms, swap_xy=%d, inv_x=%d, inv_y=%d, "
-            "accel_factor=%d, accel_threshold=%d)",
+            "base_scale=%d, accel_divisor=%d, accel_exponent=%d)",
             cfg->poll_interval_ms, cfg->swap_xy, cfg->invert_x, cfg->invert_y,
-            cfg->accel_factor, cfg->accel_threshold);
+            cfg->base_scale, cfg->accel_divisor, cfg->accel_exponent);
 
     return 0;
 }
 
-/* Devicetree instance macro */
 #define PIM447_INST(inst)                                                    \
     static struct pim447_data pim447_data_##inst;                            \
     static const struct pim447_config pim447_config_##inst = {               \
@@ -281,8 +275,9 @@ static int pim447_init(const struct device *dev)
         .swap_xy = DT_INST_PROP(inst, swap_xy),                              \
         .invert_x = DT_INST_PROP(inst, invert_x),                            \
         .invert_y = DT_INST_PROP(inst, invert_y),                            \
-        .accel_factor = DT_INST_PROP(inst, accel_factor),                    \
-        .accel_threshold = DT_INST_PROP(inst, accel_threshold),              \
+        .base_scale = DT_INST_PROP(inst, base_scale),                        \
+        .accel_divisor = DT_INST_PROP(inst, accel_divisor),                  \
+        .accel_exponent = DT_INST_PROP(inst, accel_exponent),                \
     };                                                                        \
     DEVICE_DT_INST_DEFINE(inst, pim447_init, NULL,                            \
                           &pim447_data_##inst, &pim447_config_##inst,          \

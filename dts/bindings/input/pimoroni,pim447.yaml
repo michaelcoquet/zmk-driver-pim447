@@ -1,14 +1,22 @@
 description: |
   Pimoroni PIM447 Trackball Breakout - I2C RGBW-illuminated clickable trackball.
-  Uses an onboard Nuvoton MCU to read 4 Hall-effect sensors and a dome switch,
-  and exposes movement deltas (left/right/up/down), click state, and RGBW LED
-  control over I2C.
 
-  Default I2C address is 0x0A (0x0B if address trace is cut).
+  The driver uses magnitude-based acceleration so diagonal movements get
+  the same boost as straight ones. The formula:
 
-  The driver supports an optional per-axis acceleration curve. With the
-  curve enabled, slow movements stay 1:1 (precise) and fast movements get
-  progressively boosted (responsive). See the driver source for the formula.
+    mag        = sqrt(dx^2 + dy^2)  (integer approximation)
+    over       = max(0, mag - accel-divisor)
+    scale_num  = base-scale + over^accel-exponent
+    dx_out     = dx * scale_num / 16
+    dy_out     = dy * scale_num / 16
+
+  base-scale is in 1/16ths. So base-scale=16 means 1.0x linear baseline.
+  base-scale=32 means 2.0x baseline. The acceleration term adds on top.
+
+  Suggested starting values:
+    1080p single monitor:   base-scale=32, accel-divisor=2, accel-exponent=2
+    1440p / dual 1080p:     base-scale=48, accel-divisor=2, accel-exponent=2
+    4K or multi-monitor:    base-scale=64, accel-divisor=2, accel-exponent=3
 
 compatible: "pimoroni,pim447"
 
@@ -19,8 +27,7 @@ properties:
     type: int
     default: 15
     description: |
-      Polling interval in milliseconds. Lower values give smoother tracking
-      but increase power consumption. 8-15ms is a good range.
+      Polling interval in milliseconds. 8-15ms is a good range.
 
   swap-xy:
     type: boolean
@@ -34,23 +41,26 @@ properties:
     type: boolean
     description: Invert the Y axis.
 
-  accel-factor:
+  base-scale:
+    type: int
+    default: 16
+    description: |
+      Linear baseline multiplier, in 1/16ths. base-scale=16 is 1.0x (no
+      change), base-scale=32 is 2.0x, base-scale=64 is 4.0x. This applies
+      to slow movements that are below the acceleration threshold.
+
+  accel-divisor:
     type: int
     default: 0
     description: |
-      Acceleration aggressiveness. 0 disables acceleration (linear output).
-      Typical useful values are 2-8. Higher values amplify fast movements
-      more aggressively.
+      Magnitude threshold (in raw counts) above which acceleration kicks in.
+      Below this, movements scale linearly by base-scale. Set to 0 to disable
+      acceleration entirely. Typical: 1-3.
 
-      With accel-threshold=1 and ACCEL_BASE=16 in the driver:
-
-        accel-factor = 4 gives: input 3 -> 4, input 5 -> 10, input 8 -> 22
-        accel-factor = 8 gives: input 3 -> 6, input 5 -> 15, input 8 -> 36
-
-  accel-threshold:
+  accel-exponent:
     type: int
-    default: 1
+    default: 0
     description: |
-      Movement counts at or below this value are passed through unchanged
-      (no acceleration applied). Keeps slow movements precise. A value of 1
-      means only single-count movements per poll stay 1:1.
+      Curve aggressiveness. 0 disables acceleration. 1 is linear additive,
+      2 is quadratic, 3 is cubic. Higher = much more boost at high speeds.
+      Typical: 2 for moderate, 3 for very aggressive.

@@ -8,6 +8,14 @@ zephyr_include_directories(include)
 if(CONFIG_PIM447)
     zephyr_library()
     zephyr_library_sources(drivers/input/pim447.c)
+
     zephyr_library_sources_ifdef(CONFIG_PIM447_STATUS_INDICATOR
                                  drivers/input/pim447_status.c)
+
+    # The status indicator subscribes to ZMK events. Linking against the
+    # zmk library makes ZMK's app headers (zmk/event_manager.h, the events
+    # in zmk/events/*) visible to our sources.
+    if(CONFIG_PIM447_STATUS_INDICATOR)
+        zephyr_library_link_libraries(zmk)
+    endif()
 endif()

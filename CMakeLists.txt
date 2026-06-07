@@ -12,10 +12,12 @@ if(CONFIG_PIM447)
     zephyr_library_sources_ifdef(CONFIG_PIM447_STATUS_INDICATOR
                                  drivers/input/pim447_status.c)
 
-    # The status indicator subscribes to ZMK events. Linking against the
-    # zmk library makes ZMK's app headers (zmk/event_manager.h, the events
-    # in zmk/events/*) visible to our sources.
     if(CONFIG_PIM447_STATUS_INDICATOR)
-        zephyr_library_link_libraries(zmk)
+        # The status indicator subscribes to ZMK events (zmk/event_manager.h,
+        # zmk/events/*). These headers live in the ZMK app's include directory,
+        # which isn't on our module's include path by default - add it
+        # explicitly. ZEPHYR_BASE points at the zephyr/ checkout, and ZMK is
+        # a sibling of it in the West workspace layout used by ZMK configs.
+        zephyr_library_include_directories(${ZEPHYR_BASE}/../zmk/app/include)
     endif()
 endif()

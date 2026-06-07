@@ -4,34 +4,15 @@
  *
  * Zephyr input driver for the Pimoroni PIM447 Trackball Breakout.
  *
- * MOVEMENT MODEL
- * --------------
- * The PIM447 is a low-resolution sensor. A vigorous swipe generates only
- * 5-10 counts. To make the trackball useful on large displays, we need
- * aggressive top-end scaling without losing precision for slow movements.
+ * See drivers/input/pim447.h for the public API.
  *
- * The driver computes acceleration based on the COMBINED magnitude of dx
- * and dy (not per-axis) so that diagonal movements receive the same boost
- * as straight ones. The same scale factor is applied to both axes
- * proportionally - so a 45-degree swipe accelerates as much as a pure
- * horizontal swipe of the same speed.
- *
- * Formula (integer math):
- *   mag        = approx sqrt(dx^2 + dy^2)
- *   over       = max(0, mag - accel-divisor)
- *   scale_num  = base-scale + over^accel-exponent  (clamped)
- *   dx_out     = dx * scale_num / 16
- *   dy_out     = dy * scale_num / 16
- *
- * base-scale is in 1/16ths (i.e. base-scale=16 = 1.0x linear).
- *
- * Reasonable starting values for a 1080p display:
- *   base-scale = 32       (2.0x linear baseline)
- *   accel-divisor = 2     (start accelerating after 2 counts)
- *   accel-exponent = 2    (quadratic)
+ * Movement: magnitude-based acceleration applied per-poll. See
+ * apply_acceleration() for the formula.
  */
 
 #define DT_DRV_COMPAT pimoroni_pim447
+
+#include <drivers/input/pim447.h>
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/i2c.h>
@@ -54,7 +35,6 @@ LOG_MODULE_REGISTER(pim447, CONFIG_PIM447_LOG_LEVEL);
 
 #define PIM447_MSK_SWITCH_STATE 0x80
 
-/* Caps the maximum scale factor to prevent overflow on huge deltas. */
 #define ACCEL_SCALE_MAX 16384
 
 struct pim447_motion_data {
@@ -82,10 +62,6 @@ struct pim447_data {
     bool prev_btn_state;
 };
 
-/**
- * Integer approximation of sqrt(x^2 + y^2) using alpha-max-plus-beta-min
- * (alpha=15/16, beta=15/32). Accurate to ~3.5%, plenty for cursor accel.
- */
 static inline uint32_t approx_magnitude(int32_t x, int32_t y)
 {
     uint32_t ax = (x < 0) ? -x : x;
@@ -95,9 +71,6 @@ static inline uint32_t approx_magnitude(int32_t x, int32_t y)
     return ((max_v * 15) >> 4) + ((min_v * 15) >> 5);
 }
 
-/**
- * Integer power with overflow clamp.
- */
 static inline uint32_t int_pow_clamped(uint32_t base, uint8_t exp)
 {
     if (base == 0) {
@@ -113,10 +86,6 @@ static inline uint32_t int_pow_clamped(uint32_t base, uint8_t exp)
     return (result > ACCEL_SCALE_MAX) ? ACCEL_SCALE_MAX : result;
 }
 
-/**
- * Magnitude-based acceleration. The same scale factor is applied to both
- * axes so diagonal swipes get the same boost as straight ones.
- */
 static void apply_acceleration(int16_t dx, int16_t dy,
                                const struct pim447_config *cfg,
                                int16_t *dx_out, int16_t *dy_out)
@@ -140,7 +109,6 @@ static void apply_acceleration(int16_t dx, int16_t dy,
         }
     }
 
-    /* base unit is 16, so divide by 16 after multiplying */
     int32_t sx = ((int32_t)dx * (int32_t)scale_num) / 16;
     int32_t sy = ((int32_t)dy * (int32_t)scale_num) / 16;
 
@@ -148,9 +116,6 @@ static void apply_acceleration(int16_t dx, int16_t dy,
     *dy_out = (int16_t)CLAMP(sy, INT16_MIN, INT16_MAX);
 }
 
-/**
- * Atomic 5-byte burst read of registers 0x04-0x08.
- */
 static int pim447_read_motion(const struct device *dev, struct pim447_motion_data *motion)
 {
     const struct pim447_config *cfg = dev->config;
@@ -238,7 +203,6 @@ static int pim447_init(const struct device *dev)
 {
     const struct pim447_config *cfg = dev->config;
     struct pim447_data *data = dev->data;
-    int ret;
 
     if (!i2c_is_ready_dt(&cfg->i2c)) {
         LOG_ERR("I2C bus not ready");
@@ -248,10 +212,15 @@ static int pim447_init(const struct device *dev)
     data->dev = dev;
     data->prev_btn_state = false;
 
-    ret = pim447_set_led(dev, 0, 0, 0, 30);
+#ifndef CONFIG_PIM447_STATUS_INDICATOR
+    /* If the status indicator isn't enabled, set a dim white LED here as
+     * a basic "driver alive" indicator. When the indicator IS enabled, it
+     * sets its own initial LED state in pim447_status.c, so we skip this. */
+    int ret = pim447_set_led(dev, 0, 0, 0, 30);
     if (ret < 0) {
         LOG_WRN("Failed to set initial LED: %d (continuing anyway)", ret);
     }
+#endif
 
     struct pim447_motion_data dummy;
     pim447_read_motion(dev, &dummy);

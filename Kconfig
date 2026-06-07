@@ -1,0 +1,33 @@
+# zmk-driver-pim447/Kconfig
+# Top-level Kconfig for the PIM447 trackball driver module.
+
+menuconfig PIM447
+    bool "Pimoroni PIM447 trackball driver"
+    depends on I2C
+    depends on INPUT
+    help
+      Enable the Pimoroni PIM447 Trackball Breakout driver.
+
+      The PIM447 is an I2C RGBW-illuminated clickable trackball using an
+      onboard Nuvoton MCU to read 4 Hall-effect sensors and a dome switch.
+
+if PIM447
+
+module = PIM447
+module-str = pim447
+source "subsys/logging/Kconfig.template.log_config"
+
+config PIM447_STATUS_INDICATOR
+    bool "Use PIM447 LED as a system status indicator"
+    depends on ZMK_BATTERY_REPORTING
+    default n
+    help
+      When enabled, the PIM447's onboard RGBW LED reflects system state:
+      dim white when idle, orange when battery is low, blinking red when
+      battery is critical. The trackball's movement functionality is
+      unaffected.
+
+      Phase 1 (current): peripheral-local battery level only.
+      Phase 2 (future): BLE host state, caps lock, layer indicators.
+
+endif # PIM447

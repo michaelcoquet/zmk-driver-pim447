@@ -1,6 +1,9 @@
-name: pim447
+# zmk-driver-pim447/zephyr/module.yml
+# Tells the Zephyr build system this is a module.
+
+name: zmk-driver-pim447
 build:
-  cmake: drivers/input
-  kconfig: drivers/input/Kconfig
+  cmake: .
+  kconfig: Kconfig
   settings:
     dts_root: .

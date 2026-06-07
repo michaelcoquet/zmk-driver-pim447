@@ -6,6 +6,10 @@ description: |
 
   Default I2C address is 0x0A (0x0B if address trace is cut).
 
+  The driver supports an optional per-axis acceleration curve. With the
+  curve enabled, slow movements stay 1:1 (precise) and fast movements get
+  progressively boosted (responsive). See the driver source for the formula.
+
 compatible: "pimoroni,pim447"
 
 include: [i2c-device.yaml]
@@ -16,7 +20,7 @@ properties:
     default: 15
     description: |
       Polling interval in milliseconds. Lower values give smoother tracking
-      but increase power consumption. 15ms (~67Hz) is a good balance.
+      but increase power consumption. 8-15ms is a good range.
 
   swap-xy:
     type: boolean
@@ -29,3 +33,24 @@ properties:
   invert-y:
     type: boolean
     description: Invert the Y axis.
+
+  accel-factor:
+    type: int
+    default: 0
+    description: |
+      Acceleration aggressiveness. 0 disables acceleration (linear output).
+      Typical useful values are 2-8. Higher values amplify fast movements
+      more aggressively.
+
+      With accel-threshold=1 and ACCEL_BASE=16 in the driver:
+
+        accel-factor = 4 gives: input 3 -> 4, input 5 -> 10, input 8 -> 22
+        accel-factor = 8 gives: input 3 -> 6, input 5 -> 15, input 8 -> 36
+
+  accel-threshold:
+    type: int
+    default: 1
+    description: |
+      Movement counts at or below this value are passed through unchanged
+      (no acceleration applied). Keeps slow movements precise. A value of 1
+      means only single-count movements per poll stay 1:1.

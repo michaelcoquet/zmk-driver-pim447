@@ -19,12 +19,31 @@
  *   0x07      Down movement delta (read, clears on read)
  *   0x08      Switch state (bit 7 = pressed, bits 0-6 unused; clears on read)
  *
- * Reading 5 bytes starting from register 0x04 returns [left, right, up, down, switch].
- * Movement values are unsigned 8-bit deltas that accumulate since last read.
+ * Reading 5 bytes starting from register 0x04 returns [left, right, up, down, switch]
+ * atomically in a single I2C transaction.
  *
  * This driver polls at a configurable interval, computes net X/Y deltas,
- * and reports them as INPUT_REL_X / INPUT_REL_Y / INPUT_BTN_0 events
+ * optionally applies a configurable acceleration curve, and reports the
+ * resulting movement as INPUT_REL_X / INPUT_REL_Y / INPUT_BTN_0 events
  * via the Zephyr input subsystem. ZMK picks these up through zmk,input-listener.
+ *
+ * Acceleration model (per-axis, integer math):
+ *
+ *   if |delta| <= accel-threshold:
+ *       output = delta
+ *   else:
+ *       over    = |delta| - accel-threshold
+ *       output  = delta * (ACCEL_BASE + over * accel-factor) / ACCEL_BASE
+ *
+ * With ACCEL_BASE = 16, the formula gives 1:1 below the threshold and
+ * progressively boosts faster movements. With accel-factor = 4 and
+ * accel-threshold = 1:
+ *
+ *   delta    1  2  3   4   5   6   7   8
+ *   output   1  2  4   7  10  13  16  22
+ *
+ * Larger accel-factor values give more aggressive acceleration. Set
+ * accel-factor = 0 to disable acceleration (pure linear).
  */
 
 #define DT_DRV_COMPAT pimoroni_pim447
@@ -51,6 +70,11 @@ LOG_MODULE_REGISTER(pim447, CONFIG_PIM447_LOG_LEVEL);
 
 #define PIM447_MSK_SWITCH_STATE 0x80
 
+/* Acceleration fixed-point base. Acceleration curve formula uses this as
+ * the denominator. Higher values give finer control granularity in the
+ * accel-factor devicetree property. */
+#define ACCEL_BASE 16
+
 /* Packed movement + switch data (5 bytes from reg 0x04) */
 struct pim447_motion_data {
     uint8_t left;
@@ -66,6 +90,8 @@ struct pim447_config {
     bool swap_xy;
     bool invert_x;
     bool invert_y;
+    uint16_t accel_factor;
+    uint16_t accel_threshold;
 };
 
 struct pim447_data {
@@ -75,8 +101,40 @@ struct pim447_data {
 };
 
 /**
- * Read motion and switch data from the PIM447.
- * Reads 5 bytes starting at register 0x04.
+ * Apply per-axis acceleration curve. Returns input unchanged when
+ * acceleration is disabled (accel_factor == 0) or when |delta| is at or
+ * below the threshold.
+ */
+static int16_t apply_acceleration(int16_t delta, const struct pim447_config *cfg)
+{
+    if (delta == 0 || cfg->accel_factor == 0) {
+        return delta;
+    }
+
+    int32_t abs_d = (delta < 0) ? -(int32_t)delta : (int32_t)delta;
+    if (abs_d <= (int32_t)cfg->accel_threshold) {
+        return delta;
+    }
+
+    int32_t over = abs_d - (int32_t)cfg->accel_threshold;
+    int32_t scaled = ((int32_t)delta * (ACCEL_BASE + over * (int32_t)cfg->accel_factor))
+                     / ACCEL_BASE;
+
+    /* Clamp to int16_t range */
+    if (scaled > INT16_MAX) {
+        scaled = INT16_MAX;
+    } else if (scaled < INT16_MIN) {
+        scaled = INT16_MIN;
+    }
+
+    return (int16_t)scaled;
+}
+
+/**
+ * Read motion and switch data from the PIM447 in a single atomic
+ * 5-byte burst read starting at register 0x04. The PIM447's internal
+ * counters all clear on read, so reading them together guarantees the
+ * four directional values were sampled at the same instant.
  */
 static int pim447_read_motion(const struct device *dev, struct pim447_motion_data *motion)
 {
@@ -114,7 +172,8 @@ int pim447_set_led(const struct device *dev, uint8_t r, uint8_t g, uint8_t b, ui
 
 /**
  * Periodic poll work handler.
- * Reads motion data, computes net deltas, and reports input events.
+ * Reads motion data, computes net deltas, applies acceleration,
+ * and reports input events.
  */
 static void pim447_poll_handler(struct k_work *work)
 {
@@ -132,7 +191,11 @@ static void pim447_poll_handler(struct k_work *work)
 
     /* Compute signed deltas from the unsigned left/right/up/down counters */
     int16_t dx = (int16_t)motion.right - (int16_t)motion.left;
-    int16_t dy = (int16_t)motion.down - (int16_t)motion.up;
+    int16_t dy = (int16_t)motion.down  - (int16_t)motion.up;
+
+    /* Apply per-axis acceleration curve */
+    dx = apply_acceleration(dx, cfg);
+    dy = apply_acceleration(dy, cfg);
 
     /* Apply axis transformations */
     if (cfg->swap_xy) {
@@ -201,8 +264,10 @@ static int pim447_init(const struct device *dev)
     k_work_init_delayable(&data->poll_work, pim447_poll_handler);
     k_work_reschedule(&data->poll_work, K_MSEC(cfg->poll_interval_ms));
 
-    LOG_INF("PIM447 trackball initialized (poll=%dms, swap_xy=%d, inv_x=%d, inv_y=%d)",
-            cfg->poll_interval_ms, cfg->swap_xy, cfg->invert_x, cfg->invert_y);
+    LOG_INF("PIM447 trackball initialized (poll=%dms, swap_xy=%d, inv_x=%d, inv_y=%d, "
+            "accel_factor=%d, accel_threshold=%d)",
+            cfg->poll_interval_ms, cfg->swap_xy, cfg->invert_x, cfg->invert_y,
+            cfg->accel_factor, cfg->accel_threshold);
 
     return 0;
 }
@@ -216,6 +281,8 @@ static int pim447_init(const struct device *dev)
         .swap_xy = DT_INST_PROP(inst, swap_xy),                              \
         .invert_x = DT_INST_PROP(inst, invert_x),                            \
         .invert_y = DT_INST_PROP(inst, invert_y),                            \
+        .accel_factor = DT_INST_PROP(inst, accel_factor),                    \
+        .accel_threshold = DT_INST_PROP(inst, accel_threshold),              \
     };                                                                        \
     DEVICE_DT_INST_DEFINE(inst, pim447_init, NULL,                            \
                           &pim447_data_##inst, &pim447_config_##inst,          \

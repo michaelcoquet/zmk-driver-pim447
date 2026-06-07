@@ -37,8 +37,8 @@
 LOG_MODULE_REGISTER(pim447_status, CONFIG_PIM447_LOG_LEVEL);
 
 /* Battery level thresholds (state-of-charge percentages) */
-#define BAT_LEVEL_LOW       20
-#define BAT_LEVEL_CRITICAL  10
+#define BAT_LEVEL_LOW       99
+#define BAT_LEVEL_CRITICAL  96
 #define BAT_LEVEL_DEAD       5
 
 /* LED colors and brightness */

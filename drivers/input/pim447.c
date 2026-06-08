@@ -53,6 +53,9 @@ LOG_MODULE_REGISTER(pim447, CONFIG_PIM447_LOG_LEVEL);
 
 #define PIM447_MSK_SWITCH_STATE 0x80
 
+#define PIM447_REG_INT          0xF9
+#define PIM447_MSK_INT_OUT_EN   0x02
+
 #define ACCEL_SCALE_MAX 16384
 
 struct pim447_motion_data {
@@ -169,6 +172,25 @@ int pim447_set_led(const struct device *dev, uint8_t r, uint8_t g, uint8_t b, ui
     return i2c_write_dt(&cfg->i2c, buf, sizeof(buf));
 }
 
+/* The PIM447 does not drive its INT pin on motion/button activity unless the
+ * MSK_INT_OUT_EN bit is set in REG_INT. This is volatile and must be set on
+ * every power-up. Read-modify-write to preserve the triggered flag. */
+static int pim447_enable_int_output(const struct device *dev)
+{
+    const struct pim447_config *cfg = dev->config;
+    uint8_t reg = PIM447_REG_INT;
+    uint8_t val;
+    int ret;
+
+    ret = i2c_write_read_dt(&cfg->i2c, &reg, 1, &val, 1);
+    if (ret < 0) {
+        return ret;
+    }
+
+    uint8_t buf[2] = { PIM447_REG_INT, val | PIM447_MSK_INT_OUT_EN };
+    return i2c_write_dt(&cfg->i2c, buf, sizeof(buf));
+}
+
 /* Process one motion read and report input events. Shared between
  * interrupt and polling paths. */
 static void pim447_process_motion(const struct device *dev, const struct pim447_motion_data *motion)
@@ -282,6 +304,13 @@ static int pim447_init(const struct device *dev)
             return -ENODEV;
         }
 
+        /* Without this the INT pin never asserts, so no edge ever arrives. */
+        ret = pim447_enable_int_output(dev);
+        if (ret < 0) {
+            LOG_ERR("Failed to enable INT output: %d", ret);
+            return ret;
+        }
+
         /* The PIM447 INT line is open-drain active-low. Add an internal
          * pull-up since the breakout does not include one. */
         ret = gpio_pin_configure_dt(&cfg->int_gpio, GPIO_INPUT | GPIO_PULL_UP);
@@ -307,6 +336,10 @@ static int pim447_init(const struct device *dev)
             LOG_ERR("Failed to add INT callback: %d", ret);
             return ret;
         }
+
+        /* Edge interrupts miss a line that is already low at arm time. Kick
+         * one read so any pending data is drained and the line released. */
+        k_work_reschedule(&data->work, K_NO_WAIT);
 
         LOG_INF("PIM447 trackball initialized (interrupt mode, "
                 "swap_xy=%d, inv_x=%d, inv_y=%d, "

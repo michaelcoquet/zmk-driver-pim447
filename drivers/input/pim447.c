@@ -262,7 +262,10 @@ static int pim447_init(const struct device *dev)
     data->dev = dev;
     data->prev_btn_state = false;
 
-    ret = pim447_set_led(dev, 0, 0, 0, 30);
+    /* Bright green canary: this is a pure I2C write. If the LED lights at
+     * boot, the I2C bus is acking and the problem is downstream (reads/INT).
+     * If it stays dark, I2C is not getting through - check wiring/address. */
+    ret = pim447_set_led(dev, 0, 60, 0, 0);
     if (ret < 0) {
         LOG_WRN("Failed to set initial LED: %d (continuing anyway)", ret);
     }

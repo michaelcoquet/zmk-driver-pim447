@@ -287,10 +287,11 @@ static int pim447_init(const struct device *dev)
             return ret;
         }
 
-        /* Trigger on falling edge - chip drives line low when there is
-         * motion or button activity. */
+        /* Chip drives the line low (logical active, pin is ACTIVE_LOW) when
+         * there is motion or button activity, and holds it low until the
+         * data registers are read. TO_ACTIVE is the falling edge here. */
         ret = gpio_pin_interrupt_configure_dt(&cfg->int_gpio,
-                                              GPIO_INT_EDGE_TO_INACTIVE);
+                                              GPIO_INT_EDGE_TO_ACTIVE);
         if (ret < 0) {
             LOG_ERR("Failed to configure INT interrupt: %d", ret);
             return ret;

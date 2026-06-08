@@ -1,33 +1,33 @@
 description: |
   Pimoroni PIM447 Trackball Breakout - I2C RGBW-illuminated clickable trackball.
 
-  The driver uses magnitude-based acceleration so diagonal movements get
-  the same boost as straight ones. The formula:
+  The driver supports two modes of operation:
 
-    mag        = sqrt(dx^2 + dy^2)  (integer approximation)
-    over       = max(0, mag - accel-divisor)
-    scale_num  = base-scale + over^accel-exponent
-    dx_out     = dx * scale_num / 16
-    dy_out     = dy * scale_num / 16
+    INTERRUPT-DRIVEN (preferred): if int-gpios is defined, the driver uses
+    the PIM447's INT line to wake on motion or button activity. CPU is only
+    used when there is actual input. Much better for battery life and BLE
+    responsiveness on busy systems.
 
-  base-scale is in 1/16ths. So base-scale=16 means 1.0x linear baseline.
-  base-scale=32 means 2.0x baseline. The acceleration term adds on top.
-
-  Suggested starting values:
-    1080p single monitor:   base-scale=32, accel-divisor=2, accel-exponent=2
-    1440p / dual 1080p:     base-scale=48, accel-divisor=2, accel-exponent=2
-    4K or multi-monitor:    base-scale=64, accel-divisor=2, accel-exponent=3
+    POLLING (fallback): if int-gpios is not defined, the driver polls at
+    poll-interval-ms. Easier to wire (no INT line needed) but uses more CPU.
 
 compatible: "pimoroni,pim447"
 
 include: [i2c-device.yaml]
 
 properties:
+  int-gpios:
+    type: phandle-array
+    description: |
+      GPIO connected to the PIM447's INT pad. Open-drain active-low; the
+      driver enables an internal pull-up. If this property is set, the
+      driver runs in interrupt-driven mode and poll-interval-ms is ignored.
+
   poll-interval-ms:
     type: int
     default: 15
     description: |
-      Polling interval in milliseconds. 8-15ms is a good range.
+      Polling interval in milliseconds. Used only if int-gpios is not set.
 
   swap-xy:
     type: boolean
@@ -45,22 +45,18 @@ properties:
     type: int
     default: 16
     description: |
-      Linear baseline multiplier, in 1/16ths. base-scale=16 is 1.0x (no
-      change), base-scale=32 is 2.0x, base-scale=64 is 4.0x. This applies
-      to slow movements that are below the acceleration threshold.
+      Linear baseline multiplier, in 1/16ths. base-scale=16 is 1.0x.
+      Applies to all reported movement before any acceleration kicks in.
 
   accel-divisor:
     type: int
     default: 0
     description: |
       Magnitude threshold (in raw counts) above which acceleration kicks in.
-      Below this, movements scale linearly by base-scale. Set to 0 to disable
-      acceleration entirely. Typical: 1-3.
+      Set to 0 to disable acceleration entirely.
 
   accel-exponent:
     type: int
     default: 0
     description: |
-      Curve aggressiveness. 0 disables acceleration. 1 is linear additive,
-      2 is quadratic, 3 is cubic. Higher = much more boost at high speeds.
-      Typical: 2 for moderate, 3 for very aggressive.
+      Curve aggressiveness. 0 disables. 1 linear additive, 2 quadratic, 3 cubic.

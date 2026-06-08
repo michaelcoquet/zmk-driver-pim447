@@ -250,12 +250,26 @@ static void pim447_work_handler(struct k_work *work)
     struct pim447_motion_data motion;
     int ret;
 
-    ret = pim447_read_motion(dev, &motion);
-    if (ret == 0) {
-        pim447_process_motion(dev, &motion);
-    }
-
-    if (!cfg->has_int_gpio) {
+    if (cfg->has_int_gpio) {
+        /* Edge-triggered: if new motion re-asserts INT while we are reading,
+         * the line never returns high and the next falling edge never comes,
+         * so the interrupt latches (trackball runs a moment, then freezes
+         * until reset). Drain until the chip releases the line rather than
+         * relying on catching each edge. Bounded so a stuck line that never
+         * releases cannot hang the work queue. */
+        int iters = 0;
+        do {
+            ret = pim447_read_motion(dev, &motion);
+            if (ret < 0) {
+                break;
+            }
+            pim447_process_motion(dev, &motion);
+        } while (gpio_pin_get_dt(&cfg->int_gpio) == 1 && ++iters < 64);
+    } else {
+        ret = pim447_read_motion(dev, &motion);
+        if (ret == 0) {
+            pim447_process_motion(dev, &motion);
+        }
         k_work_reschedule(dwork, K_MSEC(cfg->poll_interval_ms));
     }
 }

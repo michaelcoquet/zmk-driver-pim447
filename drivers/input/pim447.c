@@ -265,6 +265,15 @@ static void pim447_work_handler(struct k_work *work)
             }
             pim447_process_motion(dev, &motion);
         } while (gpio_pin_get_dt(&cfg->int_gpio) == 1 && ++iters < 64);
+
+        /* If the line is still held active after draining - e.g. the dome
+         * switch was held through a cold boot when waking from soft off, or an
+         * edge was otherwise missed - keep polling until it releases. The
+         * interrupt stays armed; this just prevents latching dead (which
+         * previously needed a hardware reset to clear). */
+        if (ret == 0 && gpio_pin_get_dt(&cfg->int_gpio) == 1) {
+            k_work_reschedule(dwork, K_MSEC(30));
+        }
     } else {
         ret = pim447_read_motion(dev, &motion);
         if (ret == 0) {

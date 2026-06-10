@@ -191,13 +191,12 @@ static int pim447_enable_int_output(const struct device *dev)
     return i2c_write_dt(&cfg->i2c, buf, sizeof(buf));
 }
 
-/* Process one motion read and report input events. Shared between
- * interrupt and polling paths. */
-static void pim447_process_motion(const struct device *dev, const struct pim447_motion_data *motion)
+/* Compute the accelerated, axis-corrected delta for one read. Does not report,
+ * so the caller can accumulate across a drain pass before emitting. */
+static void pim447_compute_delta(const struct pim447_config *cfg,
+                                 const struct pim447_motion_data *motion,
+                                 int16_t *dx_out, int16_t *dy_out)
 {
-    const struct pim447_config *cfg = dev->config;
-    struct pim447_data *data = dev->data;
-
     int16_t dx_raw = (int16_t)motion->right - (int16_t)motion->left;
     int16_t dy_raw = (int16_t)motion->down  - (int16_t)motion->up;
 
@@ -216,21 +215,35 @@ static void pim447_process_motion(const struct device *dev, const struct pim447_
         dy = -dy;
     }
 
-    if (dx != 0 || dy != 0) {
-        if (dx != 0) {
-            input_report_rel(dev, INPUT_REL_X, dx, dy == 0, K_FOREVER);
+    *dx_out = dx;
+    *dy_out = dy;
+}
+
+/* Emit accumulated movement and any button change as ONE batch of input
+ * events. Non-blocking (K_NO_WAIT): if the input pipeline is momentarily full,
+ * drop the events rather than stalling the system work queue - blocking it
+ * would deadlock the whole keyboard until a hardware reset. */
+static void pim447_report(const struct device *dev, int32_t acc_x, int32_t acc_y, bool btn_state)
+{
+    struct pim447_data *data = dev->data;
+
+    int16_t x = (int16_t)CLAMP(acc_x, INT16_MIN, INT16_MAX);
+    int16_t y = (int16_t)CLAMP(acc_y, INT16_MIN, INT16_MAX);
+
+    if (x != 0 || y != 0) {
+        if (x != 0) {
+            input_report_rel(dev, INPUT_REL_X, x, y == 0, K_NO_WAIT);
         }
-        if (dy != 0) {
-            input_report_rel(dev, INPUT_REL_Y, dy, true, K_FOREVER);
+        if (y != 0) {
+            input_report_rel(dev, INPUT_REL_Y, y, true, K_NO_WAIT);
         }
-        LOG_DBG("raw=(%d,%d) accel=(%d,%d)", dx_raw, dy_raw, dx, dy);
+        LOG_DBG("report accel=(%d,%d)", x, y);
     }
 
-    bool btn_pressed = (motion->sw & PIM447_MSK_SWITCH_STATE) != 0;
-    if (btn_pressed != data->prev_btn_state) {
-        input_report_key(dev, INPUT_BTN_0, btn_pressed ? 1 : 0, true, K_FOREVER);
-        data->prev_btn_state = btn_pressed;
-        LOG_DBG("btn=%d", btn_pressed);
+    if (btn_state != data->prev_btn_state) {
+        input_report_key(dev, INPUT_BTN_0, btn_state ? 1 : 0, true, K_NO_WAIT);
+        data->prev_btn_state = btn_state;
+        LOG_DBG("btn=%d", btn_state);
     }
 }
 
@@ -256,15 +269,29 @@ static void pim447_work_handler(struct k_work *work)
          * so the interrupt latches (trackball runs a moment, then freezes
          * until reset). Drain until the chip releases the line rather than
          * relying on catching each edge. Bounded so a stuck line that never
-         * releases cannot hang the work queue. */
+         * releases cannot spin forever.
+         *
+         * Accumulate the movement and report it ONCE after draining. Reporting
+         * on every read could fire dozens of input batches in a single pass
+         * during fast continuous motion, flooding the input queue and freezing
+         * the keyboard. */
+        int32_t acc_x = 0, acc_y = 0;
+        bool btn_state = data->prev_btn_state;
         int iters = 0;
+
         do {
             ret = pim447_read_motion(dev, &motion);
             if (ret < 0) {
                 break;
             }
-            pim447_process_motion(dev, &motion);
+            int16_t dx, dy;
+            pim447_compute_delta(cfg, &motion, &dx, &dy);
+            acc_x += dx;
+            acc_y += dy;
+            btn_state = (motion.sw & PIM447_MSK_SWITCH_STATE) != 0;
         } while (gpio_pin_get_dt(&cfg->int_gpio) == 1 && ++iters < 64);
+
+        pim447_report(dev, acc_x, acc_y, btn_state);
 
         /* If the line is still held active after draining - e.g. the dome
          * switch was held through a cold boot when waking from soft off, or an
@@ -277,7 +304,10 @@ static void pim447_work_handler(struct k_work *work)
     } else {
         ret = pim447_read_motion(dev, &motion);
         if (ret == 0) {
-            pim447_process_motion(dev, &motion);
+            int16_t dx, dy;
+            pim447_compute_delta(cfg, &motion, &dx, &dy);
+            bool btn_state = (motion.sw & PIM447_MSK_SWITCH_STATE) != 0;
+            pim447_report(dev, dx, dy, btn_state);
         }
         k_work_reschedule(dwork, K_MSEC(cfg->poll_interval_ms));
     }

@@ -192,11 +192,13 @@ static int pim447_enable_int_output(const struct device *dev)
     return i2c_write_dt(&cfg->i2c, buf, sizeof(buf));
 }
 
-/* Compute the accelerated, axis-corrected delta for one read. Does not report,
- * so the caller can accumulate across a drain pass before emitting. */
-static void pim447_compute_delta(const struct pim447_config *cfg,
-                                 const struct pim447_motion_data *motion,
-                                 int16_t *dx_out, int16_t *dy_out)
+/* Extract the raw, axis-uncorrected delta for one read, with jitter
+ * filtering applied. Does not accelerate or report - the caller accumulates
+ * raw deltas across a whole drain pass so acceleration below is computed
+ * from total swipe distance instead of a single read's delta. */
+static void pim447_raw_delta(const struct pim447_config *cfg,
+                             const struct pim447_motion_data *motion,
+                             int16_t *dx_out, int16_t *dy_out)
 {
     int16_t dx_raw = (int16_t)motion->right - (int16_t)motion->left;
     int16_t dy_raw = (int16_t)motion->down  - (int16_t)motion->up;
@@ -214,6 +216,24 @@ static void pim447_compute_delta(const struct pim447_config *cfg,
             dy_raw = 0;
         }
     }
+
+    *dx_out = dx_raw;
+    *dy_out = dy_raw;
+}
+
+/* Apply acceleration and axis correction to a (possibly multi-read) raw
+ * accumulated delta. Interrupt mode drains many reads per report; feeding
+ * each read's tiny delta into apply_acceleration individually meant the
+ * magnitude threshold almost never crossed even during a fast physical
+ * swipe, since each read races ahead of the ball and only ever sees a
+ * couple of counts. Accelerating the summed raw total instead makes the
+ * curve track actual swipe speed. */
+static void pim447_finalize_delta(const struct pim447_config *cfg,
+                                  int32_t acc_dx_raw, int32_t acc_dy_raw,
+                                  int16_t *dx_out, int16_t *dy_out)
+{
+    int16_t dx_raw = (int16_t)CLAMP(acc_dx_raw, INT16_MIN, INT16_MAX);
+    int16_t dy_raw = (int16_t)CLAMP(acc_dy_raw, INT16_MIN, INT16_MAX);
 
     int16_t dx, dy;
     apply_acceleration(dx_raw, dy_raw, cfg, &dx, &dy);
@@ -290,7 +310,7 @@ static void pim447_work_handler(struct k_work *work)
          * on every read could fire dozens of input batches in a single pass
          * during fast continuous motion, flooding the input queue and freezing
          * the keyboard. */
-        int32_t acc_x = 0, acc_y = 0;
+        int32_t acc_dx_raw = 0, acc_dy_raw = 0;
         bool btn_state = data->prev_btn_state;
         int iters = 0;
 
@@ -299,14 +319,16 @@ static void pim447_work_handler(struct k_work *work)
             if (ret < 0) {
                 break;
             }
-            int16_t dx, dy;
-            pim447_compute_delta(cfg, &motion, &dx, &dy);
-            acc_x += dx;
-            acc_y += dy;
+            int16_t dx_raw, dy_raw;
+            pim447_raw_delta(cfg, &motion, &dx_raw, &dy_raw);
+            acc_dx_raw += dx_raw;
+            acc_dy_raw += dy_raw;
             btn_state = (motion.sw & PIM447_MSK_SWITCH_STATE) != 0;
         } while (gpio_pin_get_dt(&cfg->int_gpio) == 1 && ++iters < 64);
 
-        pim447_report(dev, acc_x, acc_y, btn_state);
+        int16_t dx, dy;
+        pim447_finalize_delta(cfg, acc_dx_raw, acc_dy_raw, &dx, &dy);
+        pim447_report(dev, dx, dy, btn_state);
 
         /* If the line is still held active after draining - e.g. the dome
          * switch was held through a cold boot when waking from soft off, or an
@@ -319,8 +341,10 @@ static void pim447_work_handler(struct k_work *work)
     } else {
         ret = pim447_read_motion(dev, &motion);
         if (ret == 0) {
+            int16_t dx_raw, dy_raw;
+            pim447_raw_delta(cfg, &motion, &dx_raw, &dy_raw);
             int16_t dx, dy;
-            pim447_compute_delta(cfg, &motion, &dx, &dy);
+            pim447_finalize_delta(cfg, dx_raw, dy_raw, &dx, &dy);
             bool btn_state = (motion.sw & PIM447_MSK_SWITCH_STATE) != 0;
             pim447_report(dev, dx, dy, btn_state);
         }

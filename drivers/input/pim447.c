@@ -192,21 +192,34 @@ static int pim447_enable_int_output(const struct device *dev)
     return i2c_write_dt(&cfg->i2c, buf, sizeof(buf));
 }
 
-/* Extract the raw, axis-uncorrected delta for one read, with jitter
- * filtering applied. Does not accelerate or report - the caller accumulates
- * raw deltas across a whole drain pass so acceleration below is computed
- * from total swipe distance instead of a single read's delta. */
-static void pim447_raw_delta(const struct pim447_config *cfg,
-                             const struct pim447_motion_data *motion,
+/* Extract the raw, axis-uncorrected delta for one read. No filtering here -
+ * the caller accumulates raw deltas across a whole drain pass so both jitter
+ * filtering and acceleration below are computed from the total swipe, not a
+ * single read's delta. A slow real roll routinely produces single-count
+ * reads on every interrupt (reads fire faster than the encoder accumulates
+ * counts); filtering per-read would zero each one before it ever reaches the
+ * sum, discarding real motion along with genuine noise. */
+static void pim447_raw_delta(const struct pim447_motion_data *motion,
                              int16_t *dx_out, int16_t *dy_out)
 {
-    int16_t dx_raw = (int16_t)motion->right - (int16_t)motion->left;
-    int16_t dy_raw = (int16_t)motion->down  - (int16_t)motion->up;
+    *dx_out = (int16_t)motion->right - (int16_t)motion->left;
+    *dy_out = (int16_t)motion->down  - (int16_t)motion->up;
+}
 
-    /* Drop single-count sensor noise before it can be reported. Reporting
-     * it would count as real activity and reset ZMK's idle-sleep timer,
-     * keeping the board awake (and draining the battery) all night even
-     * though nothing is actually touching the trackball. */
+/* Apply jitter filtering, acceleration, and axis correction to a (possibly
+ * multi-read) raw accumulated delta. */
+static void pim447_finalize_delta(const struct pim447_config *cfg,
+                                  int32_t acc_dx_raw, int32_t acc_dy_raw,
+                                  int16_t *dx_out, int16_t *dy_out)
+{
+    int16_t dx_raw = (int16_t)CLAMP(acc_dx_raw, INT16_MIN, INT16_MAX);
+    int16_t dy_raw = (int16_t)CLAMP(acc_dy_raw, INT16_MIN, INT16_MAX);
+
+    /* Drop single-count sensor noise (summed over the whole burst) before it
+     * can be reported. Reporting it would count as real activity and reset
+     * ZMK's idle-sleep timer, keeping the board awake (and draining the
+     * battery) all night even though nothing is actually touching the
+     * trackball. */
     int16_t jt = (int16_t)cfg->jitter_threshold;
     if (jt > 0) {
         if (dx_raw >= -jt && dx_raw <= jt) {
@@ -216,24 +229,6 @@ static void pim447_raw_delta(const struct pim447_config *cfg,
             dy_raw = 0;
         }
     }
-
-    *dx_out = dx_raw;
-    *dy_out = dy_raw;
-}
-
-/* Apply acceleration and axis correction to a (possibly multi-read) raw
- * accumulated delta. Interrupt mode drains many reads per report; feeding
- * each read's tiny delta into apply_acceleration individually meant the
- * magnitude threshold almost never crossed even during a fast physical
- * swipe, since each read races ahead of the ball and only ever sees a
- * couple of counts. Accelerating the summed raw total instead makes the
- * curve track actual swipe speed. */
-static void pim447_finalize_delta(const struct pim447_config *cfg,
-                                  int32_t acc_dx_raw, int32_t acc_dy_raw,
-                                  int16_t *dx_out, int16_t *dy_out)
-{
-    int16_t dx_raw = (int16_t)CLAMP(acc_dx_raw, INT16_MIN, INT16_MAX);
-    int16_t dy_raw = (int16_t)CLAMP(acc_dy_raw, INT16_MIN, INT16_MAX);
 
     int16_t dx, dy;
     apply_acceleration(dx_raw, dy_raw, cfg, &dx, &dy);
@@ -320,7 +315,7 @@ static void pim447_work_handler(struct k_work *work)
                 break;
             }
             int16_t dx_raw, dy_raw;
-            pim447_raw_delta(cfg, &motion, &dx_raw, &dy_raw);
+            pim447_raw_delta(&motion, &dx_raw, &dy_raw);
             acc_dx_raw += dx_raw;
             acc_dy_raw += dy_raw;
             btn_state = (motion.sw & PIM447_MSK_SWITCH_STATE) != 0;
@@ -342,7 +337,7 @@ static void pim447_work_handler(struct k_work *work)
         ret = pim447_read_motion(dev, &motion);
         if (ret == 0) {
             int16_t dx_raw, dy_raw;
-            pim447_raw_delta(cfg, &motion, &dx_raw, &dy_raw);
+            pim447_raw_delta(&motion, &dx_raw, &dy_raw);
             int16_t dx, dy;
             pim447_finalize_delta(cfg, dx_raw, dy_raw, &dx, &dy);
             bool btn_state = (motion.sw & PIM447_MSK_SWITCH_STATE) != 0;

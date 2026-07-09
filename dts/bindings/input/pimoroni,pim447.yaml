@@ -60,3 +60,14 @@ properties:
     default: 0
     description: |
       Curve aggressiveness. 0 disables. 1 linear additive, 2 quadratic, 3 cubic.
+
+  jitter-threshold:
+    type: int
+    default: 1
+    description: |
+      Raw per-axis count (before acceleration) at or below which a read is
+      treated as sensor noise and dropped instead of reported. Trackball
+      encoders commonly produce single-count blips at rest (dust, vibration,
+      thermal settling); reporting these as real input keeps resetting ZMK's
+      idle-sleep timer, preventing deep sleep and draining the battery even
+      though nothing is actually being touched. Set to 0 to disable.

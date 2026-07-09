@@ -77,6 +77,7 @@ struct pim447_config {
     uint16_t base_scale;
     uint16_t accel_divisor;
     uint8_t  accel_exponent;
+    uint8_t  jitter_threshold;
 };
 
 struct pim447_data {
@@ -199,6 +200,20 @@ static void pim447_compute_delta(const struct pim447_config *cfg,
 {
     int16_t dx_raw = (int16_t)motion->right - (int16_t)motion->left;
     int16_t dy_raw = (int16_t)motion->down  - (int16_t)motion->up;
+
+    /* Drop single-count sensor noise before it can be reported. Reporting
+     * it would count as real activity and reset ZMK's idle-sleep timer,
+     * keeping the board awake (and draining the battery) all night even
+     * though nothing is actually touching the trackball. */
+    int16_t jt = (int16_t)cfg->jitter_threshold;
+    if (jt > 0) {
+        if (dx_raw >= -jt && dx_raw <= jt) {
+            dx_raw = 0;
+        }
+        if (dy_raw >= -jt && dy_raw <= jt) {
+            dy_raw = 0;
+        }
+    }
 
     int16_t dx, dy;
     apply_acceleration(dx_raw, dy_raw, cfg, &dx, &dy);
@@ -396,9 +411,11 @@ static int pim447_init(const struct device *dev)
 
         LOG_INF("PIM447 trackball initialized (interrupt mode, "
                 "swap_xy=%d, inv_x=%d, inv_y=%d, "
-                "base_scale=%d, accel_divisor=%d, accel_exponent=%d)",
+                "base_scale=%d, accel_divisor=%d, accel_exponent=%d, "
+                "jitter_threshold=%d)",
                 cfg->swap_xy, cfg->invert_x, cfg->invert_y,
-                cfg->base_scale, cfg->accel_divisor, cfg->accel_exponent);
+                cfg->base_scale, cfg->accel_divisor, cfg->accel_exponent,
+                cfg->jitter_threshold);
     } else {
         k_work_reschedule(&data->work, K_MSEC(cfg->poll_interval_ms));
 
@@ -432,6 +449,7 @@ static int pim447_init(const struct device *dev)
         .base_scale = DT_INST_PROP(inst, base_scale),                        \
         .accel_divisor = DT_INST_PROP(inst, accel_divisor),                  \
         .accel_exponent = DT_INST_PROP(inst, accel_exponent),                \
+        .jitter_threshold = DT_INST_PROP(inst, jitter_threshold),            \
     };                                                                        \
     DEVICE_DT_INST_DEFINE(inst, pim447_init, NULL,                            \
                           &pim447_data_##inst, &pim447_config_##inst,          \

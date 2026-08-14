@@ -85,6 +85,10 @@ struct pim447_data {
     struct k_work_delayable work;
     struct gpio_callback int_cb;
     bool prev_btn_state;
+    /* Sub-threshold leftover carried between bursts by the jitter filter;
+     * see pim447_finalize_delta(). */
+    int32_t residual_dx;
+    int32_t residual_dy;
 };
 
 static inline uint32_t approx_magnitude(int32_t x, int32_t y)
@@ -209,29 +213,45 @@ static void pim447_raw_delta(const struct pim447_motion_data *motion,
 /* Apply jitter filtering, acceleration, and axis correction to a (possibly
  * multi-read) raw accumulated delta. */
 static void pim447_finalize_delta(const struct pim447_config *cfg,
+                                  struct pim447_data *data,
                                   int32_t acc_dx_raw, int32_t acc_dy_raw,
                                   int16_t *dx_out, int16_t *dy_out)
 {
-    int16_t dx_raw = (int16_t)CLAMP(acc_dx_raw, INT16_MIN, INT16_MAX);
-    int16_t dy_raw = (int16_t)CLAMP(acc_dy_raw, INT16_MIN, INT16_MAX);
+    /* Fold in whatever the filter held back last time instead of starting
+     * from zero, so a slow roll - which routinely produces bursts smaller
+     * than the threshold on every single read - keeps building toward the
+     * threshold rather than getting wiped out read after read. Without this
+     * a steady slow motion never reports anything at all, since no
+     * individual burst ever clears the bar on its own. */
+    int32_t dx_raw = data->residual_dx + acc_dx_raw;
+    int32_t dy_raw = data->residual_dy + acc_dy_raw;
 
-    /* Drop single-count sensor noise (summed over the whole burst) before it
-     * can be reported. Reporting it would count as real activity and reset
-     * ZMK's idle-sleep timer, keeping the board awake (and draining the
-     * battery) all night even though nothing is actually touching the
-     * trackball. */
+    /* Drop single-count sensor noise before it can be reported. Reporting it
+     * would count as real activity and reset ZMK's idle-sleep timer, keeping
+     * the board awake (and draining the battery) all night even though
+     * nothing is actually touching the trackball.
+     *
+     * Gate on combined magnitude, not each axis independently: an
+     * independent per-axis cutoff zeroes whichever axis has the smaller
+     * component of a diagonal move (e.g. dx=1,dy=3 with threshold 1 would
+     * drop dx but keep dy), snapping deliberate diagonal motion onto a
+     * single axis. */
     int16_t jt = (int16_t)cfg->jitter_threshold;
-    if (jt > 0) {
-        if (dx_raw >= -jt && dx_raw <= jt) {
-            dx_raw = 0;
-        }
-        if (dy_raw >= -jt && dy_raw <= jt) {
-            dy_raw = 0;
-        }
+    if (jt > 0 && approx_magnitude(dx_raw, dy_raw) <= (uint32_t)jt) {
+        data->residual_dx = dx_raw;
+        data->residual_dy = dy_raw;
+        *dx_out = 0;
+        *dy_out = 0;
+        return;
     }
+    data->residual_dx = 0;
+    data->residual_dy = 0;
+
+    int16_t dx_clamped = (int16_t)CLAMP(dx_raw, INT16_MIN, INT16_MAX);
+    int16_t dy_clamped = (int16_t)CLAMP(dy_raw, INT16_MIN, INT16_MAX);
 
     int16_t dx, dy;
-    apply_acceleration(dx_raw, dy_raw, cfg, &dx, &dy);
+    apply_acceleration(dx_clamped, dy_clamped, cfg, &dx, &dy);
 
     if (cfg->swap_xy) {
         int16_t tmp = dx;
@@ -322,7 +342,7 @@ static void pim447_work_handler(struct k_work *work)
         } while (gpio_pin_get_dt(&cfg->int_gpio) == 1 && ++iters < 64);
 
         int16_t dx, dy;
-        pim447_finalize_delta(cfg, acc_dx_raw, acc_dy_raw, &dx, &dy);
+        pim447_finalize_delta(cfg, data, acc_dx_raw, acc_dy_raw, &dx, &dy);
         pim447_report(dev, dx, dy, btn_state);
 
         /* If the line is still held active after draining - e.g. the dome
@@ -339,7 +359,7 @@ static void pim447_work_handler(struct k_work *work)
             int16_t dx_raw, dy_raw;
             pim447_raw_delta(&motion, &dx_raw, &dy_raw);
             int16_t dx, dy;
-            pim447_finalize_delta(cfg, dx_raw, dy_raw, &dx, &dy);
+            pim447_finalize_delta(cfg, data, dx_raw, dy_raw, &dx, &dy);
             bool btn_state = (motion.sw & PIM447_MSK_SWITCH_STATE) != 0;
             pim447_report(dev, dx, dy, btn_state);
         }
